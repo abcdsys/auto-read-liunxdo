@@ -6,8 +6,36 @@ import dotenv from "dotenv";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import TelegramBot from "node-telegram-bot-api";
+import fetch from "node-fetch";
+import { parseStringPromise } from "xml2js";
+import { parseRss } from "./src/parse_rss.js";
+import { processAndSaveTopicData } from "./src/topic_data.js";
+import {
+  getProxyConfig,
+  getPuppeteerProxyArgs,
+  testProxyConnection,
+  getCurrentIP,
+} from "./src/proxy_config.js";
 
 dotenv.config();
+
+// 捕获未处理的异常/Promise拒绝，避免因 Target closed 之类错误导致进程退出
+process.on("unhandledRejection", (reason) => {
+  try {
+    const msg = (reason && reason.message) ? reason.message : String(reason);
+    console.warn("[unhandledRejection]", msg);
+  } catch {
+    console.warn("[unhandledRejection] (non-string reason)");
+  }
+});
+process.on("uncaughtException", (err) => {
+  try {
+    const msg = (err && err.message) ? err.message : String(err);
+    console.warn("[uncaughtException]", msg);
+  } catch {
+    console.warn("[uncaughtException] (non-string error)");
+  }
+});
 
 // 截图保存的文件夹
 // const screenshotDir = "screenshots";
@@ -47,32 +75,139 @@ const shutdownTimer = setTimeout(() => {
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const chatId = process.env.TELEGRAM_CHAT_ID;
+const groupId = process.env.TELEGRAM_GROUP_ID;
 const specificUser = process.env.SPECIFIC_USER || "14790897";
-const maxConcurrentAccounts = 4; // 每批最多同时运行的账号数
+const maxConcurrentAccounts = parseInt(process.env.MAX_CONCURRENT_ACCOUNTS) || 3; // 每批最多同时运行的账号数
 const usernames = process.env.USERNAMES.split(",");
-const passwords = process.env.PASSWORDS.split(",");
+const passwords = process.env.PASSWORDS ? process.env.PASSWORDS.split(",") : [];
+// 读取每个账号对应的Cookie（逗号分隔，与USERNAMES一一对应），有Cookie则跳过表单登录
+const cookiesEnv = process.env.COOKIES ? process.env.COOKIES.split(",") : [];
 const loginUrl = process.env.WEBSITE || "https://linux.do"; //在GitHub action环境里它不能读取默认环境变量,只能在这里设置默认值
 const delayBetweenInstances = 10000;
 const totalAccounts = usernames.length; // 总的账号数
 const delayBetweenBatches =
   runTimeLimitMillis / Math.ceil(totalAccounts / maxConcurrentAccounts);
-const isLikeSpecificUser = process.env.LIKE_SPECIFIC_USER || "false";
-const isAutoLike = process.env.AUTO_LIKE || "true";
+const isLikeSpecificUser = process.env.LIKE_SPECIFIC_USER === "true"; // 只有明确设置为"true"才开启
+const isAutoLike = process.env.AUTO_LIKE !== "false"; // 默认开启，只有明确设置为"false"才关闭
+const hideAccountInfo = process.env.HIDE_ACCOUNT_INFO !== "false"; // 默认隐藏账号信息，只有明确设置为"false"才显示
+const enableRssFetch = process.env.ENABLE_RSS_FETCH === "true"; // 是否开启抓取RSS，只有明确设置为"true"才开启，默认为false
+const enableTopicDataFetch = process.env.ENABLE_TOPIC_DATA_FETCH === "true"; // 是否开启抓取话题数据，只有明确设置为"true"才开启，默认为false
+
+// 账号名脱敏函数，默认仅显示首字母加***
+function maskUsername(username) {
+  if (!hideAccountInfo) return username;
+  if (!username || username.length === 0) return "***";
+  return username[0] + "***";
+}
+
+console.log(
+  `RSS抓取功能状态: ${enableRssFetch ? "开启" : "关闭"} (环境变量值: "${process.env.ENABLE_RSS_FETCH || ''}")，勿设置`
+);
+console.log(
+  `话题数据抓取功能状态: ${
+    enableTopicDataFetch ? "开启" : "关闭"
+  } (环境变量值: "${process.env.ENABLE_TOPIC_DATA_FETCH || ''}")，勿设置`
+);
+
+// 代理配置
+const proxyConfig = getProxyConfig();
+if (proxyConfig) {
+  console.log(
+    `代理配置: ${proxyConfig.type}://${proxyConfig.host}:${proxyConfig.port}`
+  );
+
+  // 测试代理连接
+  console.log("正在测试代理连接...");
+  const proxyWorking = await testProxyConnection(proxyConfig);
+  if (proxyWorking) {
+    console.log("✅ 代理连接测试成功");
+  } else {
+    console.log("❌ 代理连接测试失败，将使用直连");
+  }
+} else {
+  console.log("未配置代理，使用直连");
+  const currentIP = await getCurrentIP();
+  if (currentIP) {
+    console.log(`当前IP地址: ${currentIP}`);
+  }
+}
+
 let bot;
-if (token && chatId) {
+if (token && (chatId || groupId)) {
   bot = new TelegramBot(token);
 }
-function sendToTelegram(message) {
-  if (!bot) return;
-
-  bot
-    .sendMessage(chatId, message)
-    .then(() => {
-      console.log("Telegram message sent successfully");
-    })
-    .catch((error) => {
-      console.error("Error sending Telegram message:", error);
-    });
+// 简单的 Telegram 发送重试
+async function tgSendWithRetry(id, message, maxRetries = 3) {
+  let lastErr;
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      await bot.sendMessage(id, message);
+      return true;
+    } catch (e) {
+      lastErr = e;
+      const delay = 1500 * (i + 1);
+      console.error(
+        `Telegram send failed (attempt ${i + 1}/${maxRetries}): ${
+          e && e.message ? e.message : e
+        }`
+      );
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+  throw lastErr;
+}
+async function sendToTelegram(message) {
+  if (!bot || !chatId) return;
+  try {
+    await tgSendWithRetry(chatId, message, 3);
+    console.log("Telegram message sent successfully");
+  } catch (error) {
+    console.error(
+      "Error sending Telegram message:",
+      error && error.code ? error.code : "",
+      error && error.message
+        ? error.message.slice(0, 100)
+        : String(error).slice(0, 100)
+    );
+  }
+}
+async function sendToTelegramGroup(message) {
+  if (!bot || !groupId) {
+    console.error("sendToTelegramGroup: bot 或 groupId 不存在");
+    return;
+  }
+  // 过滤空内容，避免 Telegram 400 错误
+  if (!message || !String(message).trim()) {
+    console.warn("Telegram 群组推送内容为空，跳过发送");
+    return;
+  }
+  // 分割长消息，Telegram单条最大4096字符
+  const MAX_LEN = 4000;
+  if (typeof message === "string" && message.length > MAX_LEN) {
+    let start = 0;
+    let part = 1;
+    while (start < message.length) {
+      const chunk = message.slice(start, start + MAX_LEN);
+      try {
+        await tgSendWithRetry(groupId, chunk, 3);
+        console.log(`Telegram group message part ${part} sent successfully`);
+      } catch (error) {
+        console.error(
+          `Error sending Telegram group message part ${part}:`,
+          error
+        );
+      }
+      start += MAX_LEN;
+      part++;
+    }
+  } else {
+    try {
+      await tgSendWithRetry(groupId, message, 3);
+      console.log("Telegram group message sent successfully");
+    } catch (error) {
+      console.error("Error sending Telegram group message:", error);
+    }
+  }
 }
 
 //随机等待时间
@@ -84,20 +219,31 @@ function delayClick(time) {
 
 (async () => {
   try {
-    if (usernames.length !== passwords.length) {
-      console.log(usernames.length, usernames, passwords.length, passwords);
+    // 有Cookie则跳过密码数量校验
+    if (
+      cookiesEnv.filter((c) => c && c.trim()).length === 0 &&
+      passwords.length !== usernames.length
+    ) {
+      console.log(
+        `usernames: ${usernames.length}, passwords: ${passwords.length}`,
+      );
       throw new Error("用户名和密码的数量不匹配！");
     }
 
     // 并发启动浏览器实例进行登录
     const loginTasks = usernames.map((username, index) => {
-      const password = passwords[index];
+      const password = passwords[index] || "";
+      const cookie = cookiesEnv[index] ? cookiesEnv[index].trim() : null;
       const delay = (index % maxConcurrentAccounts) * delayBetweenInstances; // 使得每一组内的浏览器可以分开启动
       return () => {
-        // 确保这里返回的是函数
+        // 确保这里返回的是函数,因为settimeout本身是异步的所以必须在外面给他一个promise await才能让它同步的等待这个时间才能执行
+        // 可以改为 return async () => {
+        // await new Promise((resolve) => setTimeout(resolve, delay));
+        // return await launchBrowserForUser(username, password, cookie);
+        // };  更好理解
         return new Promise((resolve, reject) => {
           setTimeout(() => {
-            launchBrowserForUser(username, password)
+            launchBrowserForUser(username, password, cookie)
               .then(resolve)
               .catch(reject);
           }, delay);
@@ -120,7 +266,7 @@ function delayClick(time) {
       if (i + maxConcurrentAccounts < totalAccounts || i === 0) {
         console.log(`等待 ${delayBetweenBatches / 1000} 秒`);
         await new Promise((resolve) =>
-          setTimeout(resolve, delayBetweenBatches)
+          setTimeout(resolve, delayBetweenBatches),
         );
       } else {
         console.log("没有下一个批次，即将结束");
@@ -128,7 +274,7 @@ function delayClick(time) {
       console.log(
         `批次 ${
           Math.floor(i / maxConcurrentAccounts) + 1
-        } 完成，关闭浏览器...,浏览器对象：${browsers}`
+        } 完成，关闭浏览器...,浏览器对象：${browsers}`,
       );
       // 关闭所有浏览器实例
       for (const browser of browsers) {
@@ -147,24 +293,48 @@ function delayClick(time) {
     }
   }
 })();
-async function launchBrowserForUser(username, password) {
+// 将浏览器Cookie字符串（如 "name=value; name2=value2"）解析为 puppeteer setCookie 所需的对象数组
+function parseCookieString(cookieStr, domain) {
+  return cookieStr
+    .split(";")
+    .map((part) => part.trim())
+    .filter((part) => part.includes("="))
+    .map((part) => {
+      const eqIndex = part.indexOf("=");
+      const name = part.substring(0, eqIndex).trim();
+      const value = part.substring(eqIndex + 1).trim();
+      return { name, value, domain, path: "/" };
+    });
+}
+
+async function launchBrowserForUser(username, password, cookie = null) {
   let browser = null; // 在 try 之外声明 browser 变量
   try {
-    console.log("当前用户:", username);
+    console.log("当前用户:", maskUsername(username));
     const browserOptions = {
       headless: "auto",
       args: ["--no-sandbox", "--disable-setuid-sandbox"], // Linux 需要的安全设置
     };
 
-    // 如果环境变量不是 'dev'，则添加代理配置
-    // if (process.env.ENVIRONMENT !== "dev") {
-    // browserOptions["proxy"] = {
-    //   host: "38.154.227.167",
-    //   port: "5868",
-    //   username: "pqxujuyl",
-    //   password: "y1nmb5kjbz9t",
-    // };
-    // }
+    // 添加代理配置到浏览器选项
+    const proxyConfig = getProxyConfig();
+    if (proxyConfig) {
+      const proxyArgs = getPuppeteerProxyArgs(proxyConfig);
+      browserOptions.args.push(...proxyArgs);
+      console.log(
+        `为用户 ${maskUsername(username)} 启用代理: ${proxyConfig.type}://${proxyConfig.host}:${proxyConfig.port}`
+      );
+
+      // 如果有用户名密码，puppeteer-real-browser会自动处理
+      if (proxyConfig.username && proxyConfig.password) {
+        browserOptions.proxy = {
+          host: proxyConfig.host,
+          port: proxyConfig.port,
+          username: proxyConfig.username,
+          password: proxyConfig.password,
+        };
+      }
+    }
 
     var { connect } = await import("puppeteer-real-browser");
     const { page, browser: newBrowser } = await connect(browserOptions);
@@ -210,9 +380,26 @@ async function launchBrowserForUser(username, password) {
         // 设置标志变量为 true，表示即将刷新页面
         page._isReloaded = true;
         //由于油候脚本它这个时候可能会导航到新的网页,会导致直接执行代码报错,所以使用这个来在每个新网页加载之前来执行
-        await page.evaluateOnNewDocument(() => {
-          localStorage.setItem("autoLikeEnabled", "false");
-        });
+        try {
+          await page.evaluateOnNewDocument(() => {
+            localStorage.setItem("autoLikeEnabled", "false");
+          });
+        } catch (e) {
+          // Fallback to immediate evaluate when target already navigated/closed
+          try {
+            if (!page.isClosed || !page.isClosed()) {
+              await page.evaluate(() => {
+                localStorage.setItem("autoLikeEnabled", "false");
+              });
+            }
+          } catch (e2) {
+            console.warn(
+              `Skip disabling autoLike due to closed target: ${
+                (e2 && e2.message) ? e2.message : e2
+              }`
+            );
+          }
+        }
         // 等待一段时间，比如 3 秒
         await new Promise((resolve) => setTimeout(resolve, 3000));
         console.log("Retrying now...");
@@ -220,13 +407,28 @@ async function launchBrowserForUser(username, password) {
         // await page.reload();
       }
     });
-    // //登录操作
-    console.log("登录操作");
-    await login(page, username, password);
+    // 登录操作：优先使用Cookie，否则使用表单登录
+    if (cookie) {
+      console.log("检测到Cookie，跳过表单登录，直接设置Cookie");
+      const domain = new URL(loginUrl).hostname;
+      const cookieObjects = parseCookieString(cookie, domain);
+      await page.setCookie(...cookieObjects);
+      console.log(`已设置 ${cookieObjects.length} 个Cookie，正在刷新页面...`);
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await delayClick(2000);
+    } else {
+      console.log("登录操作");
+      await login(page, username, password);
+    }
     // 查找具有类名 "avatar" 的 img 元素验证登录是否成功
+    // 若存在 span.auth-buttons 则说明处于未登录状态
     const avatarImg = await page.$("img.avatar");
+    const authButtons = await page.$("span.auth-buttons");
 
-    if (avatarImg) {
+    if (authButtons) {
+      console.log("找到 auth-buttons，用户未登录，登录失败");
+      throw new Error("登录失败：页面显示未登录状态（auth-buttons）");
+    } else if (avatarImg) {
       console.log("找到avatarImg，登录成功");
     } else {
       console.log("未找到avatarImg，登录失败");
@@ -279,20 +481,95 @@ async function launchBrowserForUser(username, password) {
     });
     // 如果是Linuxdo，就导航到我的帖子，但我感觉这里写没什么用，因为外部脚本已经定义好了，不对，这里不会点击按钮，所以不会跳转，需要手动跳转
     if (loginUrl == "https://linux.do") {
-      await page.goto("https://linux.do/t/topic/13716/700", {
+      await page.goto("https://linux.do/t/topic/13716/790", {
         waitUntil: "domcontentloaded",
+        timeout: parseInt(process.env.NAV_TIMEOUT_MS || process.env.NAV_TIMEOUT || "120000", 10),
       });
     } else if (loginUrl == "https://meta.appinn.net") {
       await page.goto("https://meta.appinn.net/t/topic/52006", {
         waitUntil: "domcontentloaded",
+        timeout: parseInt(process.env.NAV_TIMEOUT_MS || process.env.NAV_TIMEOUT || "120000", 10),
       });
     } else {
       await page.goto(`${loginUrl}/t/topic/1`, {
         waitUntil: "domcontentloaded",
+        timeout: parseInt(process.env.NAV_TIMEOUT_MS || process.env.NAV_TIMEOUT || "120000", 10),
       });
+    }
+    // Ensure automation injected after navigation (fallback in case init-script failed)
+    try {
+      await page.evaluate(
+        (specificUser, scriptToEval, isAutoLike) => {
+          if (!window.__autoInjected) {
+            localStorage.setItem("read", true);
+            localStorage.setItem("specificUser", specificUser);
+            localStorage.setItem("isFirstRun", "false");
+            localStorage.setItem("autoLikeEnabled", isAutoLike);
+            try { eval(scriptToEval); } catch (e) { console.error("eval external script failed", e); }
+            window.__autoInjected = true;
+          }
+        },
+        specificUser,
+        externalScript,
+        isAutoLike
+      );
+    } catch (e) {
+      console.warn(`Post-navigation inject failed: ${e && e.message ? e.message : e}`);
     }
     if (token && chatId) {
       sendToTelegram(`${username} 登录成功`);
+    } // 监听页面跳转到新话题，自动推送RSS example：https://linux.do/t/topic/525305.rss
+    // 记录已推送过的 topicId，防止重复推送
+    if (enableRssFetch || enableTopicDataFetch) {
+      const pushedTopicIds = new Set();
+      const processedTopicIds = new Set(); // 用于话题数据处理的记录
+      page.on("framenavigated", async (frame) => {
+        if (frame.parentFrame() !== null) return;
+        const url = frame.url();
+        const match = url.match(/https:\/\/linux\.do\/t\/topic\/(\d+)/);
+        if (match) {
+          const topicId = match[1];
+
+          // RSS抓取处理
+          if (enableRssFetch && !pushedTopicIds.has(topicId)) {
+            pushedTopicIds.add(topicId);
+            const rssUrl = `https://linux.do/t/topic/${topicId}.rss`;
+            console.log("检测到话题跳转，抓取RSS：", rssUrl);
+            try {
+              // 停顿1.5秒再抓取
+              await new Promise((r) => setTimeout(r, 1500));
+              const rssPage = await browser.newPage();
+              await rssPage.goto(rssUrl, {
+                waitUntil: "domcontentloaded",
+                timeout: 20000,
+              });
+              // 停顿0.5秒再获取内容，确保页面渲染完成
+              await new Promise((r) => setTimeout(r, 1000));
+              const xml = await rssPage.evaluate(() => document.body.innerText);
+              await rssPage.close();
+              const parsedData = await parseRss(xml);
+              sendToTelegramGroup(parsedData);
+            } catch (e) {
+              console.error("抓取或发送RSS失败：", e, "可能是非公开话题");
+            }
+          }
+
+          // 话题数据抓取处理
+          if (enableTopicDataFetch && !processedTopicIds.has(topicId)) {
+            processedTopicIds.add(topicId);
+            console.log("检测到话题跳转，抓取话题数据：", url);
+            try {
+              // 停顿1秒再处理话题数据
+              await new Promise((r) => setTimeout(r, 1000));
+              await processAndSaveTopicData(page, url);
+            } catch (e) {
+              console.error("抓取或保存话题数据失败：", e);
+            }
+          }
+        }
+        // 停顿0.5秒后允许下次抓取
+        await new Promise((r) => setTimeout(r, 500));
+      });
     }
     return { browser };
   } catch (err) {
@@ -329,13 +606,19 @@ async function login(page, username, password, retryCount = 3) {
     if (loginUrl == "https://meta.appinn.net") {
       await page.goto("https://meta.appinn.net/t/topic/52006", {
         waitUntil: "domcontentloaded",
+        timeout: parseInt(process.env.NAV_TIMEOUT_MS || process.env.NAV_TIMEOUT || "120000", 10),
       });
       await page.click(".discourse-reactions-reaction-button");
     } else {
       await page.goto(`${loginUrl}/t/topic/1`, {
         waitUntil: "domcontentloaded",
+        timeout: parseInt(process.env.NAV_TIMEOUT_MS || process.env.NAV_TIMEOUT || "120000", 10),
       });
-      await page.click(".discourse-reactions-reaction-button");
+      try {
+        await page.click(".discourse-reactions-reaction-button");
+      } catch (error) {
+        console.log("没有找到点赞按钮，可能是页面没有加载完成或按钮不存在");
+      }
     }
   }
   // 等待用户名输入框加载
@@ -380,22 +663,22 @@ async function login(page, username, password, retryCount = 3) {
         alertText.includes("不正确")
       ) {
         throw new Error(
-          `非超时错误，请检查用户名密码是否正确，失败用户 ${username}, 错误信息：${alertText}`
+          `非超时错误，请检查用户名密码是否正确，失败用户 ${maskUsername(username)}, 错误信息：${alertText}`
         );
       } else {
         throw new Error(
-          `非超时错误，也不是密码错误，可能是IP导致，需使用中国美国香港台湾IP，失败用户 ${username}，错误信息：${alertText}`
+          `非超时错误，也不是密码错误，可能是IP导致，需使用中国美国香港台湾IP，失败用户 ${maskUsername(username)}，错误信息：${alertText}`
         );
       }
     } else {
       if (retryCount > 0) {
         console.log("Retrying login...");
-        await page.reload({ waitUntil: "domcontentloaded" });
+        await page.reload({ waitUntil: "domcontentloaded", timeout: parseInt(process.env.NAV_TIMEOUT_MS || process.env.NAV_TIMEOUT || "120000", 10) });
         await delayClick(2000); // 增加重试前的延迟
         return await login(page, username, password, retryCount - 1);
       } else {
         throw new Error(
-          `Navigation timed out in login.超时了,可能是IP质量问题,失败用户 ${username}, 
+          `Navigation timed out in login.超时了,可能是IP质量问题,失败用户 ${maskUsername(username)}, 
       ${error}`
         ); //{password}
       }
@@ -405,12 +688,17 @@ async function login(page, username, password, retryCount = 3) {
 }
 
 async function navigatePage(url, page, browser) {
+  try {
+    page.setDefaultNavigationTimeout(
+      parseInt(process.env.NAV_TIMEOUT_MS || process.env.NAV_TIMEOUT || "120000", 10)
+    );
+  } catch {}
   await page.goto(url, { waitUntil: "domcontentloaded" }); //如果使用默认的load,linux下页面会一直加载导致无法继续执行
 
   const startTime = Date.now(); // 记录开始时间
   let pageTitle = await page.title(); // 获取当前页面标题
 
-  while (pageTitle.includes("Just a moment")) {
+  while (pageTitle.includes("Just a moment") || pageTitle.includes("请稍候")) {
     console.log("The page is under Cloudflare protection. Waiting...");
 
     await delayClick(2000); // 每次检查间隔2秒
@@ -421,7 +709,9 @@ async function navigatePage(url, page, browser) {
     // 检查是否超过15秒
     if (Date.now() - startTime > 35000) {
       console.log("Timeout exceeded, aborting actions.");
+      sendToTelegram(`超时了,无法通过Cloudflare验证`);
       await browser.close();
+      // todo: 这里其实不能关的m因为我们是在最后统一关的你不能在这里关m如果你在这关,后面就会触发attempted to sue detached frame
       return; // 超时则退出函数
     }
   }
